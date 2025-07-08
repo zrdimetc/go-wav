@@ -1,4 +1,4 @@
-module github.com/youpy/go-wav
+module github.com/zrdimetc/go-wav
 
 go 1.17
 
