@@ -4,7 +4,7 @@ go 1.17
 
 require (
 	github.com/stretchr/testify v1.9.0
-	github.com/zrdimetc/go-riff v0.1.0
+	github.com/youpy/go-riff v0.1.0
 	github.com/zaf/g711 v1.4.0
 	gotest.tools v2.2.0+incompatible
 )
