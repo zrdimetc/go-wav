@@ -1,6 +1,8 @@
-# go-wav ![workflow status](https://github.com/youpy/go-wav/actions/workflows/go.yml/badge.svg)
+# go-wav ![workflow status](https://github.com/zrdimetc/go-wav/actions/workflows/go.yml/badge.svg)
 
 A Go library to read/write WAVE(RIFF waveform Audio) Format
+
+Forked from github.com/youpy/go-wav
 
 ## Usage
 
@@ -10,7 +12,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/youpy/go-wav"
+	"github.com/zrdimetc/go-wav"
 	"io"
 	"os"
 )
