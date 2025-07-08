@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"io"
 	"math"
 	"time"
 
@@ -15,7 +16,7 @@ type Reader struct {
 	r         *riff.Reader
 	riffChunk *riff.RIFFChunk
 	format    *WavFormat
-	*WavData
+	*WavData // Embed WavData to access its fields
 }
 
 func NewReader(r riff.RIFFReader) *Reader {
@@ -37,6 +38,8 @@ func (r *Reader) Format() (format *WavFormat, err error) {
 	return
 }
 
+// Duration calculates the total duration of the audio in the WAV file.
+// It relies on the size of the 'data' chunk, the block alignment, and the sample rate.
 func (r *Reader) Duration() (time.Duration, error) {
 	format, err := r.Format()
 	if err != nil {
@@ -48,29 +51,42 @@ func (r *Reader) Duration() (time.Duration, error) {
 		return 0.0, err
 	}
 
-	sec := float64(r.WavData.Size) / float64(format.BlockAlign) / float64(format.SampleRate)
+	// Calculate the total number of samples from the data chunk size.
+	totalSamples := float64(r.WavData.Size) / float64(format.BlockAlign)
+
+	// Calculate duration in seconds.
+	sec := totalSamples / float64(format.SampleRate)
 
 	return time.Duration(sec*1000000000) * time.Nanosecond, nil
 }
 
+// Read reads bytes from the WAV data stream into the provided byte slice p.
+// It ensures the underlying WavData is loaded before reading.
+// This method is called by oto.Player.
 func (r *Reader) Read(p []byte) (n int, err error) {
 	err = r.loadWavData()
 	if err != nil {
 		return n, err
 	}
 
+	// This now calls the Read method of the embedded WavData,
+	// which in turn calls its internalReader and updates its Position.
 	return r.WavData.Read(p)
 }
 
-func (r *Reader) ReadSamples(params ...uint32) (samples []Sample, err error) {
-	var bytes []byte
-	var numSamples, b, n int
-
-	if len(params) > 0 {
-		numSamples = int(params[0])
-	} else {
-		numSamples = 2048
+// GetCurrentPosition returns the current read position in bytes within the data chunk.
+func (r *Reader) GetCurrentPosition() (uint32, error) {
+	if r.WavData == nil {
+		return 0, errors.New("WavData not loaded yet")
 	}
+	return r.WavData.Position, nil
+}
+
+// ReadSamples reads a specified number of samples (or a default if not specified)
+// from the WAV data stream. It handles different audio formats.
+func (r *Reader) ReadSamples(params ...uint32) (samples []Sample, err error) {
+	var bytesToRead int
+	var numSamples int
 
 	format, err := r.Format()
 	if err != nil {
@@ -81,15 +97,22 @@ func (r *Reader) ReadSamples(params ...uint32) (samples []Sample, err error) {
 	blockAlign := int(format.BlockAlign)
 	bitsPerSample := int(format.BitsPerSample)
 
-	bytes = make([]byte, numSamples*blockAlign)
-	n, err = r.Read(bytes)
-
-	if err != nil {
-		return
+	if len(params) > 0 {
+		numSamples = int(params[0])
+	} else {
+		numSamples = 2048
 	}
 
-	numSamples = n / blockAlign
-	r.WavData.pos += uint32(numSamples * blockAlign)
+	bytesToRead = numSamples * blockAlign
+	bytes := make([]byte, bytesToRead)
+	n, err := r.Read(bytes) // This calls r.Read, which then calls r.WavData.Read (embedded io.Reader)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	if n == 0 && err == io.EOF {
+		return nil, io.EOF
+	}
+
 	samples = make([]Sample, numSamples)
 	offset := 0
 
@@ -99,6 +122,10 @@ func (r *Reader) ReadSamples(params ...uint32) (samples []Sample, err error) {
 
 			switch format.AudioFormat {
 			case AudioFormatIEEEFloat:
+				if soffset+3 >= n { // Check bounds against n, actual bytes read
+					err = io.EOF
+					return
+				}
 				bits :=
 					uint32((int(bytes[soffset+3]) << 24) +
 						(int(bytes[soffset+2]) << 16) +
@@ -107,29 +134,31 @@ func (r *Reader) ReadSamples(params ...uint32) (samples []Sample, err error) {
 				samples[i].Values[j] = int(math.MaxInt32 * math.Float32frombits(bits))
 
 			case AudioFormatALaw:
-				var val uint
-				pcm := g711.DecodeAlaw(bytes[soffset : soffset+(bitsPerSample/8)])
-				for b = 0; b < len(pcm); b++ {
-					val += uint(pcm[b]) << uint(b*8)
+				if soffset >= n { // Check bounds against n
+					err = io.EOF
+					return
 				}
-
-				samples[i].Values[j] = toInt(val, bitsPerSample*2)
+				pcm := g711.DecodeAlawFrame(bytes[soffset]) // Corrected to DecodeAlawFrame
+				samples[i].Values[j] = int(pcm)
 
 			case AudioFormatMULaw:
-				var val uint
-				pcm := g711.DecodeUlaw(bytes[soffset : soffset+(bitsPerSample/8)])
-				for b = 0; b < len(pcm); b++ {
-					val += uint(pcm[b]) << uint(b*8)
+				if soffset >= n { // Check bounds against n
+					err = io.EOF
+					return
 				}
-
-				samples[i].Values[j] = toInt(val, bitsPerSample*2)
+				pcm := g711.DecodeUlawFrame(bytes[soffset]) // Corrected to DecodeUlawFrame
+				samples[i].Values[j] = int(pcm)
 
 			default:
 				var val uint
-				for b = 0; b*8 < bitsPerSample; b++ {
-					val += uint(bytes[soffset+b]) << uint(b*8)
+				bytesForSample := bitsPerSample / 8
+				if soffset+bytesForSample > n { // Check bounds against n
+					err = io.EOF
+					return
 				}
-
+				for b_idx := 0; b_idx < bytesForSample; b_idx++ {
+					val += uint(bytes[soffset+b_idx]) << uint(b_idx*8)
+				}
 				samples[i].Values[j] = toInt(val, bitsPerSample)
 			}
 		}
@@ -145,7 +174,10 @@ func (r *Reader) IntValue(sample Sample, channel uint) int {
 }
 
 func (r *Reader) FloatValue(sample Sample, channel uint) float64 {
-	return float64(r.IntValue(sample, channel)) / math.Pow(2, float64(r.format.BitsPerSample)-1)
+	if r.format.BitsPerSample == 0 {
+		return 0.0
+	}
+	return float64(r.IntValue(sample, channel)) / math.Pow(2, float64(r.format.BitsPerSample-1))
 }
 
 func (r *Reader) readFormat() (fmt *WavFormat, err error) {
@@ -174,6 +206,10 @@ func (r *Reader) readFormat() (fmt *WavFormat, err error) {
 	err = binary.Read(fmtChunk, binary.LittleEndian, fmt)
 	if err != nil {
 		return
+	}
+
+	if fmt.BitsPerSample == 0 {
+		return nil, errors.New("BitsPerSample is 0, which is invalid for audio format")
 	}
 
 	return
@@ -211,7 +247,8 @@ func (r *Reader) readData() (data *WavData, err error) {
 		return
 	}
 
-	data = &WavData{bufio.NewReader(dataChunk), dataChunk.ChunkSize, 0}
+	// Initialize WavData with the internalReader set to bufio.NewReader(dataChunk)
+	data = &WavData{internalReader: bufio.NewReader(dataChunk), Size: dataChunk.ChunkSize, Position: 0}
 
 	return
 }
@@ -236,7 +273,7 @@ func toInt(value uint, bits int) int {
 	case 16:
 		result = int(int16(value))
 	case 8:
-		result = int(value)
+		result = int(int8(value))
 	default:
 		msb := uint(1 << (uint(bits) - 1))
 
